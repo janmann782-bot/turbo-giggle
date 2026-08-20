@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 # Загружаем переменные из .env файла
 load_dotenv()
-TOKEN = os.getenv('BOT_TOKEN')
+TOKEN = os.getenv('8612601521:AAGGh5yt4LcID0jh26ORVEi-CiwYaLDM6OY')
 bot = telebot.TeleBot(TOKEN)
 
 # Временное хранилище для отправленных карт
