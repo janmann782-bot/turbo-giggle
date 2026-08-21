@@ -2,16 +2,18 @@
 """
 Telegram-бот для расчёта площади / длины по красной метке на карте
 Плавный масштаб: каждому Y своё значение км/пикс
+Для длины: сначала скелет (1 px), потом измерение - толстые линии и лесенки не раздувают результат
 """
 
 import os
 import io
 import logging
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 from PIL import Image
 from dotenv import load_dotenv
+from skimage.morphology import skeletonize
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -82,44 +84,59 @@ def km2_per_px2(y: float) -> float:
     return k * k
 
 
-def find_red_pixels(img: Image.Image) -> np.ndarray:
+def get_red_mask(img: Image.Image) -> np.ndarray:
+    """Булева маска красных пикселей (H, W)"""
     arr = np.array(img.convert("RGB"))
     mask = (
         (arr[:, :, 0] >= 255 - RED_TOLERANCE)
         & (arr[:, :, 1] <= RED_TOLERANCE)
         & (arr[:, :, 2] <= RED_TOLERANCE)
     )
+    return mask
+
+
+def calculate_area(mask: np.ndarray) -> Tuple[float, float, int]:
+    """
+    Площадь: каждый красный пиксель со своим км²/пикс²
+    Возвращает (сумма км², средний коэффициент, кол-во пикселей)
+    """
     ys, xs = np.where(mask)
-    return np.column_stack((ys, xs))
-
-
-def calculate_area(red_pixels: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Площадь: каждый пиксель со своим км²/пикс²
-    Возвращает (сумма км², средний коэффициент, мин коэффициент)
-    """
-    if len(red_pixels) == 0:
-        return 0.0, 0.0, 0.0
+    if len(ys) == 0:
+        return 0.0, 0.0, 0
 
     total = 0.0
     coeffs = []
-    for y, x in red_pixels:
+    for y in ys:
         c = km2_per_px2(float(y))
         total += c
         coeffs.append(c)
 
-    return total, float(np.mean(coeffs)), float(np.min(coeffs))
+    return total, float(np.mean(coeffs)), len(ys)
 
 
-def calculate_length(red_pixels: np.ndarray) -> Tuple[float, float]:
+def calculate_length(mask: np.ndarray) -> Tuple[float, float, int, int]:
     """
-    Длина: рёбра между соседними пикселями
-    Каждый сегмент берёт средний масштаб двух концов
-    """
-    if len(red_pixels) < 2:
-        return 0.0, 0.0
+    Длина по скелету:
+    1. skeletonize - ужимаем толстую линию/лесенку до 1 px по центру
+    2. считаем длину рёбер скелета с учётом диагоналей
+    3. каждый сегмент берёт средний масштаб по Y концов
 
-    points = set((int(y), int(x)) for y, x in red_pixels)
+    Возвращает (км, средний коэфф, пикселей до скелета, пикселей скелета)
+    """
+    raw_count = int(np.sum(mask))
+    if raw_count == 0:
+        return 0.0, 0.0, 0, 0
+
+    # Скелет: толстые линии и antialias-лесенки -> тонкая осевая линия
+    skeleton = skeletonize(mask)
+    sk_ys, sk_xs = np.where(skeleton)
+    sk_count = len(sk_ys)
+
+    if sk_count < 2:
+        # одна точка или пусто - длины нет
+        return 0.0, 0.0, raw_count, sk_count
+
+    points = set(zip(sk_ys.tolist(), sk_xs.tolist()))
     neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
     visited = set()
     total_km = 0.0
@@ -133,32 +150,31 @@ def calculate_length(red_pixels: np.ndarray) -> Tuple[float, float]:
                 if edge not in visited:
                     visited.add(edge)
                     dist_px = 1.0 if dy == 0 or dx == 0 else 1.41421356237
-                    # масштаб - среднее двух точек
                     k = (km_per_px(y) + km_per_px(ny)) / 2.0
                     total_km += dist_px * k
                     coeffs.append(k)
 
     avg_k = float(np.mean(coeffs)) if coeffs else 0.0
-    return total_km, avg_k
+    return total_km, avg_k, raw_count, sk_count
 
 
 def process_image(image_bytes: bytes, mode: str) -> dict:
     img = Image.open(io.BytesIO(image_bytes))
     w, h = img.size
 
-    red = find_red_pixels(img)
-    if len(red) == 0:
+    mask = get_red_mask(img)
+    if not np.any(mask):
         raise ValueError(
             f"Красных пикселей не нашёл (допуск={RED_TOLERANCE})\n"
             "Нарисуй чисто красным: R≈255, G≈0, B≈0"
         )
 
-    mean_y = float(np.mean(red[:, 0]))
-    min_y = float(np.min(red[:, 0]))
-    max_y = float(np.max(red[:, 0]))
+    ys, xs = np.where(mask)
+    mean_y = float(np.mean(ys))
+    min_y = float(np.min(ys))
+    max_y = float(np.max(ys))
 
     result = {
-        "pixels": len(red),
         "mean_y": mean_y,
         "min_y": min_y,
         "max_y": max_y,
@@ -167,16 +183,18 @@ def process_image(image_bytes: bytes, mode: str) -> dict:
     }
 
     if mode == "area":
-        value, avg_c, min_c = calculate_area(red)
+        value, avg_c, pixels = calculate_area(mask)
         result["value"] = value
         result["unit"] = "км²"
         result["avg_coeff"] = avg_c
-        result["min_coeff"] = min_c
+        result["pixels"] = pixels
     else:
-        value, avg_k = calculate_length(red)
+        value, avg_k, raw_px, sk_px = calculate_length(mask)
         result["value"] = value
         result["unit"] = "км"
         result["avg_coeff"] = avg_k
+        result["pixels"] = raw_px
+        result["skeleton_pixels"] = sk_px
 
     return result
 
@@ -195,7 +213,7 @@ def format_result(res: dict) -> str:
         return (
             f"Готово\n\n"
             f"Карта: {res['size']}\n"
-            f"Красных пикселей: {res['pixels']}\n"
+            f"Красных пикселей: {res['pixels']} → скелет: {res['skeleton_pixels']}\n"
             f"Y: {res['min_y']:.0f} - {res['max_y']:.0f} (средний {res['mean_y']:.0f})\n"
             f"Средний коэффициент: {res['avg_coeff']:.2f} км/пикс\n\n"
             f"Длина: {res['value']:.1f} {res['unit']}"
@@ -221,10 +239,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Открой карту в редакторе\n"
         "2. Нарисуй чисто красным (R=255 G=0 B=0):\n"
         "   - пятно - если нужна площадь\n"
-        "   - тонкую линию - если нужна длина\n"
+        "   - линию (можно толстую) - если нужна длина\n"
         "3. Сохрани PNG без сжатия\n"
         "4. Пришли сюда документом\n"
         "5. Выбери что считать\n\n"
+        "Для длины линия сначала сжимается до скелета 1 px - "
+        "толщина и лесенки не раздувают результат\n\n"
         "Если карта в JPEG и красный размазался - "
         "увеличь RED_TOLERANCE в .env"
     )
